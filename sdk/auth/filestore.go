@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -79,8 +80,8 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			return "", err
 		}
 	case auth.Metadata != nil:
-		auth.Metadata["disabled"] = auth.Disabled
-		raw, errMarshal := json.Marshal(auth.Metadata)
+		metadataForSave := metadataForFileSave(auth.Metadata, auth.Disabled)
+		raw, errMarshal := json.Marshal(metadataForSave)
 		if errMarshal != nil {
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
 		}
@@ -193,6 +194,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	if err = json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("unmarshal auth json: %w", err)
 	}
+	normalizeCodexCLIAuthMetadata(metadata)
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
 		provider = "unknown"
@@ -323,6 +325,105 @@ func (s *FileTokenStore) baseDirSnapshot() string {
 	s.dirLock.RLock()
 	defer s.dirLock.RUnlock()
 	return s.baseDir
+}
+
+func normalizeCodexCLIAuthMetadata(metadata map[string]any) {
+	if metadata == nil {
+		return
+	}
+	authMode, _ := metadata["auth_mode"].(string)
+	if !strings.EqualFold(strings.TrimSpace(authMode), "chatgpt") {
+		return
+	}
+	tokens, ok := metadata["tokens"].(map[string]any)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(stringValue(tokens, "access_token")) == "" && strings.TrimSpace(stringValue(tokens, "refresh_token")) == "" {
+		return
+	}
+	metadata["type"] = "codex"
+	copyStringMetadata(metadata, tokens, "id_token")
+	copyStringMetadata(metadata, tokens, "access_token")
+	copyStringMetadata(metadata, tokens, "refresh_token")
+	copyStringMetadata(metadata, tokens, "account_id")
+	if strings.TrimSpace(stringValue(metadata, "email")) == "" || strings.TrimSpace(stringValue(metadata, "account_id")) == "" {
+		if claims, err := codexauth.ParseJWTToken(stringValue(tokens, "id_token")); err == nil && claims != nil {
+			if email := strings.TrimSpace(claims.GetUserEmail()); email != "" && strings.TrimSpace(stringValue(metadata, "email")) == "" {
+				metadata["email"] = email
+			}
+			if strings.TrimSpace(stringValue(metadata, "account_id")) == "" {
+				if accountID := strings.TrimSpace(claims.GetAccountID()); accountID != "" {
+					metadata["account_id"] = accountID
+				}
+			}
+		}
+	}
+}
+
+func metadataForFileSave(metadata map[string]any, disabled bool) map[string]any {
+	if metadata == nil {
+		return nil
+	}
+	if !isCodexCLIAuthMetadata(metadata) {
+		metadata["disabled"] = disabled
+		return metadata
+	}
+
+	result := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		switch key {
+		case "type", "id_token", "access_token", "refresh_token", "account_id", "email", "expired":
+			continue
+		default:
+			result[key] = value
+		}
+	}
+
+	tokens := make(map[string]any)
+	if existing, ok := metadata["tokens"].(map[string]any); ok {
+		for key, value := range existing {
+			tokens[key] = value
+		}
+	}
+	copyStringMetadata(tokens, metadata, "id_token")
+	copyStringMetadata(tokens, metadata, "access_token")
+	copyStringMetadata(tokens, metadata, "refresh_token")
+	copyStringMetadata(tokens, metadata, "account_id")
+
+	result["auth_mode"] = "chatgpt"
+	result["tokens"] = tokens
+	result["disabled"] = disabled
+	return result
+}
+
+func isCodexCLIAuthMetadata(metadata map[string]any) bool {
+	if metadata == nil {
+		return false
+	}
+	authMode, _ := metadata["auth_mode"].(string)
+	if !strings.EqualFold(strings.TrimSpace(authMode), "chatgpt") {
+		return false
+	}
+	_, ok := metadata["tokens"].(map[string]any)
+	return ok
+}
+
+func copyStringMetadata(dst, src map[string]any, key string) {
+	if dst == nil || src == nil {
+		return
+	}
+	if value := strings.TrimSpace(stringValue(src, key)); value != "" {
+		dst[key] = value
+	}
+}
+
+func stringValue(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, _ := metadata[key].(string)
+	return value
 }
 
 func extractAccessToken(metadata map[string]any) string {

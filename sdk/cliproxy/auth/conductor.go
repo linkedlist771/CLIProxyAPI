@@ -2436,6 +2436,38 @@ func isRequestInvalidError(err error) bool {
 	}
 }
 
+// ApplyRuntimeQuotaState updates runtime-only quota hints without persisting auth files.
+func (m *Manager) ApplyRuntimeQuotaState(ctx context.Context, authID string, limited bool, recoverAt time.Time, reason string) bool {
+	_ = ctx
+	if m == nil || strings.TrimSpace(authID) == "" {
+		return false
+	}
+	if reason = strings.TrimSpace(reason); reason == "" {
+		reason = "runtime_quota"
+	}
+
+	changed := false
+	if limited {
+		changed = SetRuntimeQuotaHint(authID, RuntimeQuotaHint{Limited: true, RecoverAt: recoverAt, Reason: reason})
+	} else {
+		changed = ClearRuntimeQuotaHint(authID, reason)
+	}
+	if !changed {
+		return false
+	}
+
+	var snapshot *Auth
+	m.mu.RLock()
+	if auth := m.auths[authID]; auth != nil {
+		snapshot = auth.Clone()
+	}
+	m.mu.RUnlock()
+	if m.scheduler != nil && snapshot != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
+	return true
+}
+
 func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) {
 	if auth == nil {
 		return

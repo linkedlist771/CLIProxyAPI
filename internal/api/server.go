@@ -609,6 +609,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/codex-api-key", s.mgmt.PutCodexKeys)
 		mgmt.PATCH("/codex-api-key", s.mgmt.PatchCodexKey)
 		mgmt.DELETE("/codex-api-key", s.mgmt.DeleteCodexKey)
+		mgmt.GET("/codex/accounts", s.mgmt.ListCodexAccounts)
 
 		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
 		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
@@ -796,16 +797,28 @@ func (s *Server) Start() error {
 	if s == nil || s.server == nil {
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
 	}
+	codexUsageCacheStarted := false
+	if s.mgmt != nil {
+		s.mgmt.StartCodexUsageCache(context.Background(), time.Minute)
+		codexUsageCacheStarted = true
+	}
+	stopCodexUsageCache := func() {
+		if codexUsageCacheStarted && s.mgmt != nil {
+			s.mgmt.StopCodexUsageCache()
+		}
+	}
 
 	useTLS := s.cfg != nil && s.cfg.TLS.Enable
 	if useTLS {
 		cert := strings.TrimSpace(s.cfg.TLS.Cert)
 		key := strings.TrimSpace(s.cfg.TLS.Key)
 		if cert == "" || key == "" {
+			stopCodexUsageCache()
 			return fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
 		}
 		log.Debugf("Starting API server on %s with TLS", s.server.Addr)
 		if errServeTLS := s.server.ListenAndServeTLS(cert, key); errServeTLS != nil && !errors.Is(errServeTLS, http.ErrServerClosed) {
+			stopCodexUsageCache()
 			return fmt.Errorf("failed to start HTTPS server: %v", errServeTLS)
 		}
 		return nil
@@ -813,6 +826,7 @@ func (s *Server) Start() error {
 
 	log.Debugf("Starting API server on %s", s.server.Addr)
 	if errServe := s.server.ListenAndServe(); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
+		stopCodexUsageCache()
 		return fmt.Errorf("failed to start HTTP server: %v", errServe)
 	}
 
@@ -829,6 +843,9 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+	if s.mgmt != nil {
+		s.mgmt.StopCodexUsageCache()
+	}
 
 	if s.keepAliveEnabled {
 		select {

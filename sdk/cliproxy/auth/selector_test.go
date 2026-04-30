@@ -313,6 +313,55 @@ func TestIsAuthBlockedForModel_UnavailableWithoutNextRetryIsNotBlocked(t *testin
 	}
 }
 
+func TestIsAuthBlockedForModel_RuntimeQuotaHintBlocksRequestedModel(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	next := now.Add(10 * time.Minute)
+	auth := &Auth{ID: "runtime-quota-hint"}
+	SetRuntimeQuotaHint(auth.ID, RuntimeQuotaHint{Limited: true, RecoverAt: next, Reason: "codex_usage"})
+	t.Cleanup(func() { ClearRuntimeQuotaHint(auth.ID, "codex_usage") })
+
+	blocked, reason, gotNext := isAuthBlockedForModel(auth, "test-model", now)
+	if !blocked {
+		t.Fatal("blocked = false, want true")
+	}
+	if reason != blockReasonCooldown {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonCooldown)
+	}
+	if !gotNext.Equal(next) {
+		t.Fatalf("next = %v, want %v", gotNext, next)
+	}
+	if auth.Unavailable || auth.Quota.Exceeded || !auth.NextRetryAfter.IsZero() {
+		t.Fatalf("runtime hint mutated auth: unavailable=%v quota=%#v next=%v", auth.Unavailable, auth.Quota, auth.NextRetryAfter)
+	}
+}
+
+func TestIsAuthBlockedForModel_AuthLevelQuotaBlocksRequestedModel(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	next := now.Add(10 * time.Minute)
+	auth := &Auth{
+		ID:             "a",
+		Unavailable:    true,
+		NextRetryAfter: next,
+		Quota:          QuotaState{Exceeded: true, Reason: "codex_usage", NextRecoverAt: next},
+		ModelStates:    map[string]*ModelState{},
+	}
+
+	blocked, reason, gotNext := isAuthBlockedForModel(auth, "test-model", now)
+	if !blocked {
+		t.Fatal("blocked = false, want true")
+	}
+	if reason != blockReasonCooldown {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonCooldown)
+	}
+	if !gotNext.Equal(next) {
+		t.Fatalf("next = %v, want %v", gotNext, next)
+	}
+}
+
 func TestFillFirstSelectorPick_ThinkingSuffixFallsBackToBaseModelState(t *testing.T) {
 	t.Parallel()
 

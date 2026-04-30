@@ -1,6 +1,7 @@
 package synthesizer
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -131,6 +132,63 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 	}
 }
 
+func TestFileSynthesizer_Synthesize_CodexCLIAuthFile(t *testing.T) {
+	tempDir := t.TempDir()
+	authData := map[string]any{
+		"auth_mode":      "chatgpt",
+		"OPENAI_API_KEY": nil,
+		"tokens": map[string]any{
+			"id_token":      fakeCodexIDToken(t, "codex@example.com", "acct-123", "plus"),
+			"access_token":  "access-token",
+			"refresh_token": "refresh-token",
+			"account_id":    "acct-123",
+		},
+		"last_refresh": "2026-04-24T01:20:08Z",
+	}
+	data, err := json.Marshal(authData)
+	if err != nil {
+		t.Fatalf("failed to marshal auth file: %v", err)
+	}
+	if err = os.WriteFile(filepath.Join(tempDir, "authen.json"), data, 0644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Date(2026, 4, 24, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	auth := auths[0]
+	if auth.Provider != "codex" {
+		t.Fatalf("expected provider codex, got %s", auth.Provider)
+	}
+	if auth.Label != "codex@example.com" {
+		t.Fatalf("expected label codex@example.com, got %s", auth.Label)
+	}
+	if got, _ := auth.Metadata["access_token"].(string); got != "access-token" {
+		t.Fatalf("expected access token, got %q", got)
+	}
+	if got, _ := auth.Metadata["refresh_token"].(string); got != "refresh-token" {
+		t.Fatalf("expected refresh token, got %q", got)
+	}
+	if got, _ := auth.Metadata["account_id"].(string); got != "acct-123" {
+		t.Fatalf("expected account id acct-123, got %q", got)
+	}
+	if got := auth.Attributes["plan_type"]; got != "plus" {
+		t.Fatalf("expected plan_type plus, got %q", got)
+	}
+}
+
 func TestFileSynthesizer_Synthesize_GeminiProviderMapping(t *testing.T) {
 	tempDir := t.TempDir()
 
@@ -164,6 +222,23 @@ func TestFileSynthesizer_Synthesize_GeminiProviderMapping(t *testing.T) {
 	if auths[0].Provider != "gemini-cli" {
 		t.Errorf("gemini should be mapped to gemini-cli, got %s", auths[0].Provider)
 	}
+}
+
+func fakeCodexIDToken(t *testing.T, email, accountID, planType string) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payloadMap := map[string]any{
+		"email": email,
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": accountID,
+			"chatgpt_plan_type":  planType,
+		},
+	}
+	payload, err := json.Marshal(payloadMap)
+	if err != nil {
+		t.Fatalf("marshal jwt payload: %v", err)
+	}
+	return header + "." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
 }
 
 func TestFileSynthesizer_Synthesize_SkipsInvalidFiles(t *testing.T) {

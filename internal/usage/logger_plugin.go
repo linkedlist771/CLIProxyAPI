@@ -50,13 +50,25 @@ func (p *LoggerPlugin) HandleUsage(ctx context.Context, record coreusage.Record)
 	p.stats.Record(ctx, record)
 }
 
-// SetStatisticsEnabled toggles whether in-memory statistics are recorded.
+// SetStatisticsEnabled toggles whether usage statistics are recorded.
 func SetStatisticsEnabled(enabled bool) { statisticsEnabled.Store(enabled) }
 
 // StatisticsEnabled reports the current recording state.
 func StatisticsEnabled() bool { return statisticsEnabled.Load() }
 
-// RequestStatistics maintains aggregated request metrics in memory.
+type usageStore interface {
+	Insert(ctx context.Context, apiName, modelName string, detail RequestDetail) error
+	Load(ctx context.Context) ([]storedRequest, error)
+	Close() error
+}
+
+type storedRequest struct {
+	APIName   string
+	ModelName string
+	Detail    RequestDetail
+}
+
+// RequestStatistics maintains aggregated request metrics in memory and can persist details.
 type RequestStatistics struct {
 	mu sync.RWMutex
 
@@ -71,6 +83,8 @@ type RequestStatistics struct {
 	requestsByHour map[int]int64
 	tokensByDay    map[string]int64
 	tokensByHour   map[int]int64
+
+	store usageStore
 }
 
 // apiStats holds aggregated metrics for a single API key.
@@ -151,6 +165,62 @@ func NewRequestStatistics() *RequestStatistics {
 	}
 }
 
+// ConfigureStore attaches persistent storage and replays stored rows into memory.
+func (s *RequestStatistics) ConfigureStore(ctx context.Context, store usageStore) error {
+	if s == nil {
+		if store != nil {
+			return store.Close()
+		}
+		return nil
+	}
+	var rows []storedRequest
+	var err error
+	if store != nil {
+		rows, err = store.Load(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
+	s.mu.Lock()
+	oldStore := s.store
+	s.store = store
+	s.resetLocked()
+	for _, row := range rows {
+		apiName := strings.TrimSpace(row.APIName)
+		if apiName == "" {
+			apiName = "unknown"
+		}
+		modelName := strings.TrimSpace(row.ModelName)
+		if modelName == "" {
+			modelName = "unknown"
+		}
+		detail := normaliseRequestDetail(row.Detail)
+		s.recordDetailLocked(apiName, modelName, detail)
+	}
+	s.mu.Unlock()
+
+	if oldStore != nil && oldStore != store {
+		return oldStore.Close()
+	}
+	return nil
+}
+
+// CloseStore closes any attached persistent storage.
+func (s *RequestStatistics) CloseStore() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	store := s.store
+	s.store = nil
+	s.mu.Unlock()
+	if store != nil {
+		return store.Close()
+	}
+	return nil
+}
+
 // Record ingests a new usage record and updates the aggregates.
 func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record) {
 	if s == nil {
@@ -163,49 +233,85 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if timestamp.IsZero() {
 		timestamp = time.Now()
 	}
-	detail := normaliseDetail(record.Detail)
-	totalTokens := detail.TotalTokens
+	tokens := normaliseDetail(record.Detail)
 	statsKey := record.APIKey
 	if statsKey == "" {
 		statsKey = resolveAPIIdentifier(ctx, record)
+	}
+	statsKey = strings.TrimSpace(statsKey)
+	if statsKey == "" {
+		statsKey = "unknown"
 	}
 	failed := record.Failed
 	if !failed {
 		failed = !resolveSuccess(ctx)
 	}
-	success := !failed
-	modelName := record.Model
+	modelName := strings.TrimSpace(record.Model)
 	if modelName == "" {
 		modelName = "unknown"
 	}
-	dayKey := timestamp.Format("2006-01-02")
-	hourKey := timestamp.Hour()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.totalRequests++
-	if success {
-		s.successCount++
-	} else {
-		s.failureCount++
-	}
-	s.totalTokens += totalTokens
-
-	stats, ok := s.apis[statsKey]
-	if !ok {
-		stats = &apiStats{Models: make(map[string]*modelStats)}
-		s.apis[statsKey] = stats
-	}
-	s.updateAPIStats(stats, modelName, RequestDetail{
+	detail := normaliseRequestDetail(RequestDetail{
 		Timestamp: timestamp,
 		LatencyMs: normaliseLatency(record.Latency),
 		Source:    record.Source,
 		AuthIndex: record.AuthIndex,
-		Tokens:    detail,
+		Tokens:    tokens,
 		Failed:    failed,
 	})
 
+	var store usageStore
+	s.mu.Lock()
+	s.recordDetailLocked(statsKey, modelName, detail)
+	store = s.store
+	s.mu.Unlock()
+
+	if store != nil {
+		persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := store.Insert(persistCtx, statsKey, modelName, detail); err != nil {
+			logStoreError("persist usage record", err)
+		}
+	}
+}
+
+func (s *RequestStatistics) resetLocked() {
+	s.totalRequests = 0
+	s.successCount = 0
+	s.failureCount = 0
+	s.totalTokens = 0
+	s.apis = make(map[string]*apiStats)
+	s.requestsByDay = make(map[string]int64)
+	s.requestsByHour = make(map[int]int64)
+	s.tokensByDay = make(map[string]int64)
+	s.tokensByHour = make(map[int]int64)
+}
+
+func (s *RequestStatistics) recordDetailLocked(apiName, modelName string, detail RequestDetail) {
+	detail = normaliseRequestDetail(detail)
+	totalTokens := detail.Tokens.TotalTokens
+	if totalTokens < 0 {
+		totalTokens = 0
+	}
+
+	s.totalRequests++
+	if detail.Failed {
+		s.failureCount++
+	} else {
+		s.successCount++
+	}
+	s.totalTokens += totalTokens
+
+	stats, ok := s.apis[apiName]
+	if !ok || stats == nil {
+		stats = &apiStats{Models: make(map[string]*modelStats)}
+		s.apis[apiName] = stats
+	} else if stats.Models == nil {
+		stats.Models = make(map[string]*modelStats)
+	}
+	s.updateAPIStats(stats, modelName, detail)
+
+	dayKey := detail.Timestamp.Format("2006-01-02")
+	hourKey := detail.Timestamp.Hour()
 	s.requestsByDay[dayKey]++
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
@@ -297,9 +403,15 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 		return result
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	type insertedRequest struct {
+		apiName   string
+		modelName string
+		detail    RequestDetail
+	}
+	inserted := make([]insertedRequest, 0)
+	var store usageStore
 
+	s.mu.Lock()
 	seen := make(map[string]struct{})
 	for apiName, stats := range s.apis {
 		if stats == nil {
@@ -320,64 +432,38 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 		if apiName == "" {
 			continue
 		}
-		stats, ok := s.apis[apiName]
-		if !ok || stats == nil {
-			stats = &apiStats{Models: make(map[string]*modelStats)}
-			s.apis[apiName] = stats
-		} else if stats.Models == nil {
-			stats.Models = make(map[string]*modelStats)
-		}
 		for modelName, modelSnapshot := range apiSnapshot.Models {
 			modelName = strings.TrimSpace(modelName)
 			if modelName == "" {
 				modelName = "unknown"
 			}
 			for _, detail := range modelSnapshot.Details {
-				detail.Tokens = normaliseTokenStats(detail.Tokens)
-				if detail.LatencyMs < 0 {
-					detail.LatencyMs = 0
-				}
-				if detail.Timestamp.IsZero() {
-					detail.Timestamp = time.Now()
-				}
+				detail = normaliseRequestDetail(detail)
 				key := dedupKey(apiName, modelName, detail)
 				if _, exists := seen[key]; exists {
 					result.Skipped++
 					continue
 				}
 				seen[key] = struct{}{}
-				s.recordImported(apiName, modelName, stats, detail)
+				s.recordDetailLocked(apiName, modelName, detail)
+				inserted = append(inserted, insertedRequest{apiName: apiName, modelName: modelName, detail: detail})
 				result.Added++
+			}
+		}
+	}
+	store = s.store
+	s.mu.Unlock()
+
+	if store != nil {
+		ctx := context.Background()
+		for _, row := range inserted {
+			if err := store.Insert(ctx, row.apiName, row.modelName, row.detail); err != nil {
+				logStoreError("persist imported usage record", err)
 			}
 		}
 	}
 
 	return result
-}
-
-func (s *RequestStatistics) recordImported(apiName, modelName string, stats *apiStats, detail RequestDetail) {
-	totalTokens := detail.Tokens.TotalTokens
-	if totalTokens < 0 {
-		totalTokens = 0
-	}
-
-	s.totalRequests++
-	if detail.Failed {
-		s.failureCount++
-	} else {
-		s.successCount++
-	}
-	s.totalTokens += totalTokens
-
-	s.updateAPIStats(stats, modelName, detail)
-
-	dayKey := detail.Timestamp.Format("2006-01-02")
-	hourKey := detail.Timestamp.Hour()
-
-	s.requestsByDay[dayKey]++
-	s.requestsByHour[hourKey]++
-	s.tokensByDay[dayKey] += totalTokens
-	s.tokensByHour[hourKey] += totalTokens
 }
 
 func dedupKey(apiName, modelName string, detail RequestDetail) string {
@@ -466,6 +552,17 @@ func normaliseTokenStats(tokens TokenStats) TokenStats {
 		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
 	}
 	return tokens
+}
+
+func normaliseRequestDetail(detail RequestDetail) RequestDetail {
+	detail.Tokens = normaliseTokenStats(detail.Tokens)
+	if detail.LatencyMs < 0 {
+		detail.LatencyMs = 0
+	}
+	if detail.Timestamp.IsZero() {
+		detail.Timestamp = time.Now()
+	}
+	return detail
 }
 
 func normaliseLatency(latency time.Duration) int64 {

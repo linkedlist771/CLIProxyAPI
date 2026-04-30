@@ -75,6 +75,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
 		return nil
 	}
+	normalizeCodexCLIAuthMetadata(metadata)
 	t, _ := metadata["type"].(string)
 	if t == "" {
 		return nil
@@ -181,6 +182,55 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	return []*coreauth.Auth{a}
+}
+
+func normalizeCodexCLIAuthMetadata(metadata map[string]any) {
+	if metadata == nil {
+		return
+	}
+	authMode, _ := metadata["auth_mode"].(string)
+	if !strings.EqualFold(strings.TrimSpace(authMode), "chatgpt") {
+		return
+	}
+	tokens, ok := metadata["tokens"].(map[string]any)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(stringValue(tokens, "access_token")) == "" && strings.TrimSpace(stringValue(tokens, "refresh_token")) == "" {
+		return
+	}
+	metadata["type"] = "codex"
+	copyStringMetadata(metadata, tokens, "id_token")
+	copyStringMetadata(metadata, tokens, "access_token")
+	copyStringMetadata(metadata, tokens, "refresh_token")
+	copyStringMetadata(metadata, tokens, "account_id")
+	if strings.TrimSpace(stringValue(metadata, "email")) == "" || strings.TrimSpace(stringValue(metadata, "account_id")) == "" {
+		if claims, errParse := codex.ParseJWTToken(stringValue(tokens, "id_token")); errParse == nil && claims != nil {
+			if email := strings.TrimSpace(claims.GetUserEmail()); email != "" && strings.TrimSpace(stringValue(metadata, "email")) == "" {
+				metadata["email"] = email
+			}
+			if accountID := strings.TrimSpace(claims.GetAccountID()); accountID != "" && strings.TrimSpace(stringValue(metadata, "account_id")) == "" {
+				metadata["account_id"] = accountID
+			}
+		}
+	}
+}
+
+func copyStringMetadata(dst, src map[string]any, key string) {
+	if dst == nil || src == nil {
+		return
+	}
+	if value := strings.TrimSpace(stringValue(src, key)); value != "" {
+		dst[key] = value
+	}
+}
+
+func stringValue(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, _ := metadata[key].(string)
+	return value
 }
 
 // SynthesizeGeminiVirtualAuths creates virtual Auth entries for multi-project Gemini credentials.

@@ -48,6 +48,9 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	codexUsageCacheMu   sync.RWMutex
+	codexUsageCache     map[string]codexUsageCacheEntry
+	codexUsageCancel    func()
 }
 
 // NewHandler creates a new management handler instance.

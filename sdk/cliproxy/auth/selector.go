@@ -375,6 +375,12 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if blocked, reason, next := runtimeQuotaBlock(auth.ID, now); blocked {
+		return blocked, reason, next
+	}
+	if blocked, reason, next := authLevelBlock(auth, now); blocked {
+		return blocked, reason, next
+	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			state, ok := auth.ModelStates[model]
@@ -411,6 +417,10 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		}
 		return false, blockReasonNone, time.Time{}
 	}
+	return authLevelBlock(auth, now)
+}
+
+func authLevelBlock(auth *Auth, now time.Time) (bool, blockReason, time.Time) {
 	if auth.Unavailable && auth.NextRetryAfter.After(now) {
 		next := auth.NextRetryAfter
 		if !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
